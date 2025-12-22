@@ -1,7 +1,10 @@
 import re
 import logging
 import threading
-from datetime import datetime, timedelta
+import calendar
+from datetime import datetime
+from functools import lru_cache
+from typing import Dict, List, Any
 
 import requests
 
@@ -14,34 +17,25 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def get_current_month_info() -> dict:
+def get_current_month_info() -> Dict[str, str]:
     """
     获取当前月份的开始和结束时间。
 
-    该方法计算当前月份的开始日期和结束日期，并将它们返回为字典，
-    字典中包含这两项的字符串表示。
-
     Returns:
-        包含当前月份开始和结束时间的字典。
+        Dict[str, str]: 包含当前月份开始和结束时间的字典。
     """
     now = datetime.now()
     # 当前月份的第一天
-    start_of_month = datetime(now.year, now.month, 1)
+    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    # 当前月份的最后一天
+    _, last_day = calendar.monthrange(now.year, now.month)
+    end_of_month = now.replace(day=last_day, hour=0, minute=0, second=0, microsecond=0)
 
-    # 下个月的第一天
-    if now.month == 12:
-        next_month_start = datetime(now.year + 1, 1, 1)
-    else:
-        next_month_start = datetime(now.year, now.month + 1, 1)
-
-    # 当前月份的最后一天（下个月第一天减一天）
-    end_of_month = next_month_start - timedelta(days=1)
-
-    # 格式化为字符串
-    start_time_str = start_of_month.strftime("%Y-%m-%d %H:%M:%S")
-    end_time_str = end_of_month.strftime("%Y-%m-%d 00:00:00Z")
-
-    return {"startTime": start_time_str, "endTime": end_time_str}
+    return {
+        "startTime": start_of_month.strftime("%Y-%m-%d %H:%M:%S"),
+        "endTime": end_of_month.strftime("%Y-%m-%d 00:00:00Z")
+    }
 
 
 def desensitize_name(name: str) -> str:
@@ -54,16 +48,42 @@ def desensitize_name(name: str) -> str:
     Returns:
         str: 脱敏后的姓名。
     """
-    name = name.strip()  # 去除前后空格，防止输入有空格影响判断
-
+    if not name:
+        return ""
+        
+    name = name.strip()
     n = len(name)
-    if n < 3:
+    
+    if n < 2:
+        return name
+    elif n == 2:
         return f"{name[0]}*"
     else:
         return f"{name[0]}{'*' * (n - 2)}{name[-1]}"
 
 
-def is_holiday(current_datetime: datetime = datetime.now()) -> bool:
+@lru_cache(maxsize=1)
+def _fetch_holiday_data(year: int) -> List[Dict[str, Any]]:
+    """
+    从远程获取节假日数据并缓存。
+    
+    Args:
+        year (int): 年份。
+        
+    Returns:
+        List[Dict[str, Any]]: 节假日数据列表。
+    """
+    try:
+        url = f"https://gh-proxy.com/https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{year}.json"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json().get("days", [])
+    except Exception as e:
+        logger.error(f"获取节假日数据失败: {e}")
+        return []
+
+
+def is_holiday(current_datetime: datetime = None) -> bool:
     """
     判断当前日期是否为节假日或周末。
 
@@ -73,30 +93,25 @@ def is_holiday(current_datetime: datetime = datetime.now()) -> bool:
     Returns:
         bool: 是否为节假日。
     """
-    # 获取当前年份和日期字符串
+    if current_datetime is None:
+        current_datetime = datetime.now()
+        
     year = current_datetime.year
     current_date = current_datetime.strftime("%Y-%m-%d")
 
-    # 从远程获取节假日数据
-    response = requests.get(
-        f"https://gh-proxy.com/https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{year}.json",
-        timeout=10,  # 设置超时时间，防止请求挂起
-    )
-
-    holiday_list = response.json().get("days", [])
+    holiday_list = _fetch_holiday_data(year)
 
     # 遍历节假日数据，检查当前日期是否为节假日
     for holiday in holiday_list:
         if holiday.get("date") == current_date:
-            is_off_day = holiday.get("isOffDay", False)
-            return is_off_day
+            return holiday.get("isOffDay", False)
 
     # 如果不是节假日，检查是否为周末
-    is_weekend = current_datetime.weekday() > 4  # 周末为星期六（5）和星期日（6）
-    return is_weekend
+    # 周末为星期六（5）和星期日（6）
+    return current_datetime.weekday() > 4
 
 
-def strip_markdown(text):
+def strip_markdown(text: str) -> str:
     """
     过滤Markdown标记，保留文本内容和换行符
 
@@ -106,6 +121,9 @@ def strip_markdown(text):
     Returns:
         str: 过滤后的纯文本
     """
+    if not text:
+        return ""
+
     # 1. 移除注释
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
 
@@ -127,12 +145,9 @@ def strip_markdown(text):
     # 7. 移除脚注定义 例如 [^1]: some text
     text = re.sub(r"^\[\^.+?\]:.*$", "", text, flags=re.MULTILINE)
 
-    # 8. 移除表格分隔（仅去除 | 和 ---、不动表格实际内容）
-    text = re.sub(r"^\s*\|?(?:\s*[:-]+\s*\|)+\s*[:-]+\s*\|?\s*$",
-                  "",
-                  text,
-                  flags=re.MULTILINE)
-    text = re.sub(r"\|", " ", text)  # 用空格替掉行内|
+    # 8. 移除表格分隔
+    text = re.sub(r"^\s*\|?(?:\s*[:-]+\s*\|)+\s*[:-]+\s*\|?\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\|", " ", text)
 
     # 9. 移除水平分割线
     text = re.sub(r"^\s*([-*_])[ \1]{2,}\s*$", "", text, flags=re.MULTILINE)
@@ -141,19 +156,18 @@ def strip_markdown(text):
     text = re.sub(r"~~(.*?)~~", r"\1", text)
 
     # 11. 移除粗体和斜体标记
-    text = re.sub(r"\*\*\*(.*?)\*\*\*", r"\1", text)  # ***bold italic***
+    text = re.sub(r"\*\*\*(.*?)\*\*\*", r"\1", text)
     text = re.sub(r"___(.*?)___", r"\1", text)
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)  # **bold**
-    text = re.sub(r"__(.*?)__", r"\1", text)  # __bold__
-    text = re.sub(r"\*(.*?)\*", r"\1", text)  # *italic*
-    text = re.sub(r"_(.*?)_", r"\1", text)  # _italic_
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"__(.*?)__", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
+    text = re.sub(r"_(.*?)_", r"\1", text)
 
-    # 12. 移除标题标记 (保留标题文本)
+    # 12. 移除标题标记
     text = re.sub(r"^#{1,6}\s+(.*)$", r"\1", text, flags=re.MULTILINE)
 
     # 13. 移除列表标记
-    text = re.sub(r"^(\s*)[-*+]\s+\[.\]\s+", r"\1", text,
-                  flags=re.MULTILINE)  # 任务列表勾选框
+    text = re.sub(r"^(\s*)[-*+]\s+\[.\]\s+", r"\1", text, flags=re.MULTILINE)
     text = re.sub(r"^(\s*)[-*+]\s+", r"\1", text, flags=re.MULTILINE)
     text = re.sub(r"^(\s*)\d+\.\s+", r"\1", text, flags=re.MULTILINE)
 
@@ -165,6 +179,5 @@ def strip_markdown(text):
 
     # 16. 多空白行合并
     text = re.sub(r"\n\s*\n", "\n\n", text)
-    text = text.strip()
-
-    return text
+    
+    return text.strip()

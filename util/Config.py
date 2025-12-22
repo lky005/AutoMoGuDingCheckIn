@@ -3,7 +3,7 @@ import logging
 import random
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 # 尝试导入主模块的日志上下文，失败则创建本地版本
 try:
@@ -18,13 +18,13 @@ class ConfigManager:
     """管理配置文件的加载、验证和更新。"""
 
     def __init__(self,
-                 path: Optional[str] = None,
+                 path: Optional[Union[str, Path]] = None,
                  config: Optional[Dict[str, Any]] = None):
         """
         初始化ConfigManager实例。
 
         Args:
-            path (Optional[str]): 配置文件的路径。默认为 None。
+            path (Optional[Union[str, Path]]): 配置文件的路径。默认为 None。
             config (Optional[Dict[str, Any]]): 直接传入的配置字典。如果传入此参数，则不从文件加载配置。默认为 None。
         """
         if config is not None:
@@ -36,6 +36,34 @@ class ConfigManager:
             self._config = self._load_config()
         else:
             raise ValueError("必须提供路径或配置字典之一")
+
+    def _apply_location_offset(self, config: Dict[str, Any]) -> None:
+        """
+        为经纬度添加随机偏移。
+        
+        Args:
+            config (Dict[str, Any]): 配置字典。
+        """
+        try:
+            # 确保 config 和 clockIn 字典存在
+            config.setdefault("config", {})
+            clock_in = config["config"].setdefault("clockIn", {})
+            
+            # 检查并添加 mode 字段
+            if "mode" not in clock_in:
+                clock_in["mode"] = "daily"
+                logger.warning("配置文件中缺少 'mode' 字段，已自动添加默认值 'daily'。")
+
+            # 确保 location 字典存在
+            location = clock_in.setdefault("location", {})
+
+            # 为经纬度添加随机偏移
+            for coord in ["latitude", "longitude"]:
+                value = location.get(coord)
+                if isinstance(value, str) and len(value) > 1:
+                    location[coord] = value[:-1] + str(random.randint(0, 9))
+        except Exception as e:
+            logger.warning(f"应用位置偏移时发生错误: {e}")
 
     def _load_config(self) -> Dict[str, Any]:
         """
@@ -49,33 +77,22 @@ class ConfigManager:
             json.JSONDecodeError: 如果配置文件格式错误。
         """
         try:
+            if not self._path.exists():
+                raise FileNotFoundError(f"配置文件未找到: {self._path}")
+
             # 打开并加载配置文件
-            with open(str(self._path), "r", encoding="utf-8") as jsonfile:
+            with self._path.open("r", encoding="utf-8") as jsonfile:
                 config = json.load(jsonfile)
 
-            # 确保 config 和 clockIn 字典存在
-            config.setdefault("config", {})
-            clock_in = config["config"].setdefault("clockIn", {})
-
-            # 检查并添加 mode 字段
-            if "mode" not in clock_in:
-                clock_in["mode"] = "daily"
-                logger.warning("配置文件中缺少 'mode' 字段，已自动添加默认值 'daily'。"
-                               "请尽快更新配置文件以确保正确性。")
-
-            # 确保 location 字典存在
-            location = clock_in.setdefault("location", {})
-
-            # 为经纬度添加随机偏移
-            for coord in ["latitude", "longitude"]:
-                value = location.get(coord)
-                if isinstance(value, str) and len(value) > 1:
-                    location[coord] = value[:-1] + str(random.randint(0, 9))
-
+            self._apply_location_offset(config)
+            
             logger.info(f"配置文件已加载: {self._path}")
             return config
         except (FileNotFoundError, json.JSONDecodeError) as e:
             logger.error(f"配置文件加载失败: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"加载配置文件时发生意外错误: {e}")
             raise
 
     def get_value(self, *keys: str) -> Any:
@@ -95,7 +112,8 @@ class ConfigManager:
                 for sub_key in key.split("."):
                     value = value[sub_key]
             return value
-        except KeyError:
+        except (KeyError, TypeError):
+            # TypeError 处理 value 为 None 还要继续取值得情况
             logger.warning(f"配置键不存在: {'->'.join(keys)}")
             return None
 

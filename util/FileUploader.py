@@ -1,6 +1,7 @@
 import os
 import io
 import random
+from typing import Optional
 
 from PIL import Image
 
@@ -33,9 +34,12 @@ def process_image(image_path: str) -> bytes:
         max_quality = 95
 
         # 使用二分查找方法优化质量压缩
+        # 预先定义BytesIO对象，避免循环中重复创建（虽然差异不大，但更清晰）
+        img_byte_arr = io.BytesIO()
+
         while max_quality - min_quality > 5:
-            # 将图片保存到内存缓冲区
-            img_byte_arr = io.BytesIO()
+            img_byte_arr.seek(0)
+            img_byte_arr.truncate(0)
             img.save(img_byte_arr, format="JPEG", quality=quality)
 
             # 获取当前图片大小
@@ -55,7 +59,8 @@ def process_image(image_path: str) -> bytes:
                 break
 
         # 最终保存并返回图片数据
-        img_byte_arr = io.BytesIO()
+        img_byte_arr.seek(0)
+        img_byte_arr.truncate(0)
         img.save(img_byte_arr, format="JPEG", quality=quality)
 
         return img_byte_arr.getvalue()
@@ -77,8 +82,12 @@ def upload_img(token: str, snowFlakeId: str, userId: str, count: int) -> str:
         return ""
 
     # 获取图片文件夹路径
-    images_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "images")
+    # 使用abspath确保路径正确
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    images_dir = os.path.join(base_dir, "images")
+
+    if not os.path.exists(images_dir):
+        return ""
 
     # 获取所有符合条件的图片文件路径
     all_images = [
@@ -86,7 +95,8 @@ def upload_img(token: str, snowFlakeId: str, userId: str, count: int) -> str:
         if f.lower().endswith((".png", ".jpg", ".jpeg"))
     ]
 
-    # 如果图片数量不够，直接返回空
+    # 如果图片数量不够，直接返回空 (或者上传所有可用的?)
+    # 原逻辑是直接返回空，保持原样
     if len(all_images) < count:
         return ""
 
@@ -94,6 +104,16 @@ def upload_img(token: str, snowFlakeId: str, userId: str, count: int) -> str:
     selected_images = random.sample(all_images, count)
 
     # 处理选中的图片并上传
-    processed_images = [process_image(img) for img in selected_images]
+    processed_images = []
+    for img_path in selected_images:
+        try:
+            processed_images.append(process_image(img_path))
+        except Exception as e:
+            # 记录日志或忽略坏图
+            print(f"处理图片失败 {img_path}: {e}") # 这里应该用logger，但这个文件没有logger
+            continue
+            
+    if not processed_images:
+        return ""
 
     return upload(token, snowFlakeId, userId, processed_images)

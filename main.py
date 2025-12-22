@@ -3,10 +3,10 @@ import os
 import json
 import argparse
 import random
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
 import concurrent.futures
-import threading  # 新增: 线程本地存储用于日志上下文
+import threading
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Callable
 
 from coreApi.MainLogicApi import ApiClient
 from coreApi.AiServiceClient import generate_article
@@ -20,7 +20,6 @@ _log_ctx = threading.local()
 
 
 class UserTagFormatter(logging.Formatter):
-
     def format(self, record):
         # 在格式化前添加 userTag 属性
         record.userTag = getattr(_log_ctx, "tag", "-")
@@ -34,7 +33,8 @@ if not _root_logger.handlers:
     handler = logging.StreamHandler()
     formatter = UserTagFormatter(
         fmt="[%(asctime)s] %(name)s %(levelname)s [%(userTag)s]: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S")
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     handler.setFormatter(formatter)
     _root_logger.addHandler(handler)
     _root_logger.setLevel(logging.INFO)
@@ -44,18 +44,8 @@ logger = logging.getLogger(__name__)
 USER_DIR = os.path.join(os.path.dirname(__file__), "user")
 
 
-def perform_clock_in(api_client: ApiClient,
-                     config: ConfigManager) -> Dict[str, Any]:
-    """
-    执行打卡操作。
-
-    Args:
-        api_client (ApiClient): ApiClient 实例。
-        config (ConfigManager): 配置管理器。
-
-    Returns:
-        Dict[str, Any]: 执行结果。
-    """
+def perform_clock_in(api_client: ApiClient, config: ConfigManager) -> Dict[str, Any]:
+    """执行打卡操作"""
     try:
         current_time = datetime.now()
         current_hour = current_time.hour
@@ -68,44 +58,55 @@ def perform_clock_in(api_client: ApiClient,
             checkin_type = "END"
             display_type = "下班"
 
-        # 判断是否为节假日模式并跳过打卡
-        if config.get_value(
-                "config.clockIn.mode") == "holiday" and is_holiday():
-            if not config.get_value("config.clockIn.specialClockIn"):
-                return {
-                    "status": "skip",
-                    "message": "今天是休息日，已跳过打卡",
-                    "task_type": "打卡",
-                }
-            checkin_type = "HOLIDAY"
-            display_type = "休息/节假日"
+        # 检查配置：是否跳过节假日/自定义日期
+        clock_in_mode = config.get_value("config.clockIn.mode")
+        special_clock_in = config.get_value("config.clockIn.specialClockIn")
 
-        # 判断自定义打卡日期模式并跳过打卡
-        elif config.get_value("config.clockIn.mode") == "custom":
-            today = datetime.today().weekday() + 1  # 获取星期几（1-7）
-            if today not in config.get_value("config.clockIn.customDays"):
-                if not config.get_value("config.clockIn.specialClockIn"):
-                    return {
-                        "status": "skip",
-                        "message": "今天不在设置打卡时间范围内，已跳过打卡",
-                        "task_type": "打卡",
-                    }
+        should_skip = False
+        skip_message = ""
+
+        if clock_in_mode == "holiday" and is_holiday(current_time):
+            if not special_clock_in:
+                should_skip = True
+                skip_message = "今天是休息日，已跳过打卡"
+            else:
                 checkin_type = "HOLIDAY"
                 display_type = "休息/节假日"
+
+        elif clock_in_mode == "custom":
+            today_weekday = current_time.weekday() + 1
+            custom_days = config.get_value("config.clockIn.customDays") or []
+            if today_weekday not in custom_days:
+                if not special_clock_in:
+                    should_skip = True
+                    skip_message = "今天不在设置打卡时间范围内，已跳过打卡"
+                else:
+                    checkin_type = "HOLIDAY"
+                    display_type = "休息/节假日"
+
+        if should_skip:
+            return {
+                "status": "skip",
+                "message": skip_message,
+                "task_type": "打卡",
+            }
 
         last_checkin_info = api_client.get_checkin_info()
 
         # 检查是否已经打过卡
-        if last_checkin_info and last_checkin_info["type"] == checkin_type:
-            last_checkin_time = datetime.strptime(
-                last_checkin_info["createTime"], "%Y-%m-%d %H:%M:%S")
-            if last_checkin_time.date() == current_time.date():
-                logger.info(f"今日 {display_type} 卡已打，无需重复打卡")
-                return {
-                    "status": "skip",
-                    "message": f"今日 {display_type} 卡已打，无需重复打卡",
-                    "task_type": "打卡",
-                }
+        if last_checkin_info and last_checkin_info.get("type") == checkin_type:
+            create_time_str = last_checkin_info.get("createTime")
+            if create_time_str:
+                last_checkin_time = datetime.strptime(
+                    create_time_str, "%Y-%m-%d %H:%M:%S"
+                )
+                if last_checkin_time.date() == current_time.date():
+                    logger.info(f"今日 {display_type} 卡已打，无需重复打卡")
+                    return {
+                        "status": "skip",
+                        "message": f"今日 {display_type} 卡已打，无需重复打卡",
+                        "task_type": "打卡",
+                    }
 
         user_name = desensitize_name(config.get_value("userInfo.nikeName"))
         logger.info(f"用户 {user_name} 开始 {display_type} 打卡")
@@ -117,9 +118,9 @@ def perform_clock_in(api_client: ApiClient,
             config.get_value("userInfo.userId"),
             config.get_value("config.clockIn.imageCount"),
         )
-        description = (
-            random.choice(config.get_value("config.clockIn.description"))
-            if config.get_value("config.clockIn.description") else None)
+
+        description_list = config.get_value("config.clockIn.description")
+        description = random.choice(description_list) if description_list else None
 
         # 设置打卡信息
         checkin_info = {
@@ -145,429 +146,303 @@ def perform_clock_in(api_client: ApiClient,
         }
     except Exception as e:
         logger.error(f"打卡失败: {e}")
-        return {
-            "status": "fail",
-            "message": f"打卡失败: {str(e)}",
-            "task_type": "打卡"
-        }
+        return {"status": "fail", "message": f"打卡失败: {str(e)}", "task_type": "打卡"}
 
 
-def submit_daily_report(api_client: ApiClient,
-                        config: ConfigManager) -> Dict[str, Any]:
-    """
-    提交日报。
+def _submit_report_common(
+    api_client: ApiClient,
+    config: ConfigManager,
+    report_type: str,
+    title_func: Callable[[int], str],
+    check_time_func: Callable[[datetime], bool],
+    get_submitted_func: Callable[[], Dict[str, Any]],
+    paper_num_key: str,
+    image_count_key: str,
+    task_name: str,
+    form_type: int,
+) -> Dict[str, Any]:
+    """通用日报/周报/月报提交逻辑"""
 
-    Args:
-        api_client (ApiClient): ApiClient 实例。
-        config (ConfigManager): 配置管理器。
+    # 映射 report_type 到 config key
+    config_key_map = {"day": "daily", "week": "weekly", "month": "monthly"}
+    config_key = config_key_map.get(report_type)
 
-    Returns:
-        Dict[str, Any]: 执行结果。
-    """
-    if not config.get_value("config.reportSettings.daily.enabled"):
-        logger.info("用户未开启日报提交功能，跳过日报提交任务")
+    if not config.get_value(f"config.reportSettings.{config_key}.enabled"):
+        logger.info(f"用户未开启{task_name}功能，跳过")
         return {
             "status": "skip",
-            "message": "用户未开启日报提交功能",
-            "task_type": "日报提交",
+            "message": f"用户未开启{task_name}功能",
+            "task_type": task_name,
         }
 
     current_time = datetime.now()
-    if not (current_time.hour >= 12):
-        logger.info("未到日报提交时间（需12点后）")
+
+    # 检查提交时间
+    if not check_time_func(current_time):
+        logger.info(f"未到{task_name}提交时间")
         return {
             "status": "skip",
-            "message": "未到日报提交时间（需12点后）",
-            "task_type": "日报提交",
+            "message": f"未到{task_name}提交时间",
+            "task_type": task_name,
         }
 
     try:
-        # 获取历史提交记录
-        submitted_reports_info = api_client.get_submitted_reports_info("day")
+        # 检查是否已提交
+        submitted_reports_info = get_submitted_func()
         submitted_reports = submitted_reports_info.get("data", [])
 
-        # 检查是否已经提交过今天的日报
+        # 检查重复逻辑 (略有不同，由调用者保证 get_submitted_func 返回正确数据)
+        # 对于日报：检查日期
+        # 对于周报：检查 weeks 字段
+        # 对于月报：检查 yearmonth 字段
+
+        count = submitted_reports_info.get("flag", 0) + 1
+        title = title_func(count)
+
         if submitted_reports:
             last_report = submitted_reports[0]
-            last_submit_time = datetime.strptime(last_report["createTime"],
-                                                 "%Y-%m-%d %H:%M:%S")
-            if last_submit_time.date() == current_time.date():
-                logger.info("今天已经提交过日报，跳过本次提交")
+            should_skip = False
+
+            if report_type == "day":
+                last_time = datetime.strptime(
+                    last_report["createTime"], "%Y-%m-%d %H:%M:%S"
+                )
+                if last_time.date() == current_time.date():
+                    should_skip = True
+            elif report_type == "week":
+                # 周报 title 类似 "第X周周报"，或者 weeks 字段 "第X周"
+                # API 返回的 weeks 字段比较可靠
+                current_week_info = api_client.get_weeks_date()[0]
+                current_week_str = f"第{count}周"  # 注意这里 count 是基于 flag+1，可能不准确如果重复提交
+                # 更稳健的方式：检查 last_report 的 createTime 是否在当前周范围内
+                # 但原代码是用 weeks 字符串匹配
+                if last_report.get("weeks") == current_week_str:
+                    should_skip = True
+            elif report_type == "month":
+                current_yearmonth = current_time.strftime("%Y-%m")
+                if last_report.get("yearmonth") == current_yearmonth:
+                    should_skip = True
+
+            if should_skip:
+                logger.info(f"本周期已经提交过{task_name}，跳过")
                 return {
                     "status": "skip",
-                    "message": "今天已经提交过日报",
-                    "task_type": "日报提交",
+                    "message": f"本周期已经提交过{task_name}",
+                    "task_type": task_name,
                 }
 
+        # 生成内容
         job_info = api_client.get_job_info()
-        report_count = submitted_reports_info.get("flag", 0) + 1
         content = generate_article(
             config,
-            f"第{report_count}天日报",
+            title,
             job_info,
-            config.get_value("planInfo.planPaper.dayPaperNum"),
+            config.get_value(paper_num_key),
         )
 
-        # 上传图片并获取附件
+        # 上传图片
         attachments = upload_img(
             api_client.get_upload_token(),
             config.get_value("userInfo.orgJson.snowFlakeId"),
             config.get_value("userInfo.userId"),
-            config.get_value("config.reportSettings.daily.imageCount"),
+            config.get_value(image_count_key),
         )
 
         report_info = {
-            "title": f"第{report_count}天日报",
+            "title": title,
             "content": content,
             "attachments": attachments,
-            "reportType": "day",
+            "reportType": report_type,
             "jobId": job_info.get("jobId", None),
             "reportTime": current_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "formFieldDtoList": api_client.get_from_info(7),
+            "formFieldDtoList": api_client.get_from_info(form_type),
         }
+
+        # 特定类型的额外字段
+        extra_details = {}
+        if report_type == "week":
+            current_week_info = api_client.get_weeks_date()[0]
+            report_info["startTime"] = current_week_info.get("startTime")
+            report_info["endTime"] = current_week_info.get("endTime")
+            report_info["weeks"] = f"第{count}周"
+            extra_details = {
+                "开始时间": report_info["startTime"],
+                "结束时间": report_info["endTime"],
+            }
+        elif report_type == "month":
+            report_info["yearmonth"] = current_time.strftime("%Y-%m")
+            extra_details = {"提交月份": report_info["yearmonth"]}
+
         api_client.submit_report(report_info)
 
-        logger.info(
-            f"第{report_count}天日报已提交，提交时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
+        logger.info(f"{title}已提交")
+
         return {
             "status": "success",
-            "message": f"第{report_count}天日报已提交",
-            "task_type": "日报提交",
+            "message": f"{title}已提交",
+            "task_type": task_name,
             "details": {
-                "日报标题": f"第{report_count}天日报",
+                "标题": title,
                 "提交时间": current_time.strftime("%Y-%m-%d %H:%M:%S"),
                 "附件": attachments,
+                **extra_details,
             },
             "report_content": content,
         }
+
     except Exception as e:
-        logger.error(f"日报提交失败: {e}")
+        logger.error(f"{task_name}提交失败: {e}")
         return {
             "status": "fail",
-            "message": f"日报提交失败: {str(e)}",
-            "task_type": "日报提交",
+            "message": f"{task_name}提交失败: {str(e)}",
+            "task_type": task_name,
         }
 
 
-def submit_weekly_report(config: ConfigManager,
-                         api_client: ApiClient) -> Dict[str, Any]:
-    """提交周报
+def submit_daily_report(api_client: ApiClient, config: ConfigManager) -> Dict[str, Any]:
+    """提交日报"""
+    return _submit_report_common(
+        api_client=api_client,
+        config=config,
+        report_type="day",
+        title_func=lambda c: f"第{c}天日报",
+        check_time_func=lambda t: t.hour >= 12,
+        get_submitted_func=lambda: api_client.get_submitted_reports_info("day"),
+        paper_num_key="planInfo.planPaper.dayPaperNum",
+        image_count_key="config.reportSettings.daily.imageCount",
+        task_name="日报提交",
+        form_type=7,
+    )
 
-    Args:
-        config (ConfigManager): 配置管理器。
-        api_client (ApiClient): ApiClient 实例。
 
-    Returns:
-        Dict[str, Any]: 执行结果。
-    """
-    if not config.get_value("config.reportSettings.weekly.enabled"):
-        logger.info("用户未开启周报提交功能，跳过周报提交任务")
-        return {
-            "status": "skip",
-            "message": "用户未开启周报提交功能",
-            "task_type": "周报提交",
-        }
-
-    current_time = datetime.now()
+def submit_weekly_report(
+    config: ConfigManager, api_client: ApiClient
+) -> Dict[str, Any]:
+    """提交周报"""
     submit_day = config.get_value("config.reportSettings.weekly.submitTime")
 
-    if current_time.weekday() + 1 != submit_day or not (current_time.hour
-                                                        >= 12):
-        logger.info("未到周报提交时间")
-        return {
-            "status": "skip",
-            "message": "未到周报提交时间",
-            "task_type": "周报提交",
-        }
+    def check_time(t: datetime) -> bool:
+        # weekday() 返回 0-6 (周一-周日)，配置通常是 1-7
+        return (t.weekday() + 1 == submit_day) and (t.hour >= 12)
 
-    try:
-        # 获取当前周信息
-        current_week_info = api_client.get_weeks_date()[0]
-
-        # 获取历史提交记录
-        submitted_reports_info = api_client.get_submitted_reports_info("week")
-        submitted_reports = submitted_reports_info.get("data", [])
-
-        # 获取当前周数
-        week = submitted_reports_info.get("flag", 0) + 1
-        current_week_string = f"第{week}周"
-
-        # 检查是否已经提交过本周的周报
-        if submitted_reports:
-            last_report = submitted_reports[0]
-            if last_report.get("weeks") == current_week_string:
-                logger.info("本周已经提交过周报，跳过本次提交")
-                return {
-                    "status": "skip",
-                    "message": "本周已经提交过周报",
-                    "task_type": "周报提交",
-                }
-
-        job_info = api_client.get_job_info()
-        content = generate_article(
-            config,
-            f"第{week}周周报",
-            job_info,
-            config.get_value("planInfo.planPaper.weekPaperNum"),
-        )
-
-        # 上传图片并获取附件
-        attachments = upload_img(
-            api_client.get_upload_token(),
-            config.get_value("userInfo.orgJson.snowFlakeId"),
-            config.get_value("userInfo.userId"),
-            config.get_value("config.reportSettings.weekly.imageCount"),
-        )
-
-        report_info = {
-            "title": f"第{week}周周报",
-            "content": content,
-            "attachments": attachments,
-            "reportType": "week",
-            "endTime": current_week_info.get("endTime"),
-            "startTime": current_week_info.get("startTime"),
-            "jobId": job_info.get("jobId", None),
-            "weeks": current_week_string,
-            "formFieldDtoList": api_client.get_from_info(8),
-        }
-        api_client.submit_report(report_info)
-
-        logger.info(
-            f"第{week}周周报已提交，开始时间：{current_week_info.get('startTime')},结束时间：{current_week_info.get('endTime')}"
-        )
-
-        return {
-            "status": "success",
-            "message": f"第{week}周周报已提交",
-            "task_type": "周报提交",
-            "details": {
-                "周报标题": f"第{week}周周报",
-                "开始时间": current_week_info.get("startTime"),
-                "结束时间": current_week_info.get("endTime"),
-                "附件": attachments,
-            },
-            "report_content": content,
-        }
-    except Exception as e:
-        logger.error(f"周报提交失败: {e}")
-        return {
-            "status": "fail",
-            "message": f"周报提交失败: {str(e)}",
-            "task_type": "周报提交",
-        }
+    return _submit_report_common(
+        api_client=api_client,
+        config=config,
+        report_type="week",
+        title_func=lambda c: f"第{c}周周报",
+        check_time_func=check_time,
+        get_submitted_func=lambda: api_client.get_submitted_reports_info("week"),
+        paper_num_key="planInfo.planPaper.weekPaperNum",
+        image_count_key="config.reportSettings.weekly.imageCount",
+        task_name="周报提交",
+        form_type=8,
+    )
 
 
-def submit_monthly_report(config: ConfigManager,
-                          api_client: ApiClient) -> Dict[str, Any]:
-    """提交月报
-
-    Args:
-        config (ConfigManager): 配置管理器。
-        api_client (ApiClient): ApiClient 实例。
-
-    Returns:
-        Dict[str, Any]: 执行结果。
-    """
-    if not config.get_value("config.reportSettings.monthly.enabled"):
-        logger.info("用户未开启月报提交功能，跳过月报提交任务")
-        return {
-            "status": "skip",
-            "message": "用户未开启月报提交功能",
-            "task_type": "月报提交",
-        }
-
-    current_time = datetime.now()
-    last_day_of_month = (current_time.replace(day=1) +
-                         timedelta(days=32)).replace(day=1) - timedelta(days=1)
+def submit_monthly_report(
+    config: ConfigManager, api_client: ApiClient
+) -> Dict[str, Any]:
+    """提交月报"""
     submit_day = config.get_value("config.reportSettings.monthly.submitTime")
 
-    if current_time.day != min(
-            submit_day,
-            last_day_of_month.day) or not (current_time.hour >= 12):
-        logger.info("未到月报提交时间")
-        return {
-            "status": "skip",
-            "message": "未到月报提交时间",
-            "task_type": "月报提交",
-        }
+    def check_time(t: datetime) -> bool:
+        # 计算当月最后一天
+        next_month = t.replace(day=28) + timedelta(days=4)
+        last_day_of_month = (next_month - timedelta(days=next_month.day)).day
+        target_day = min(submit_day, last_day_of_month)
+        return (t.day == target_day) and (t.hour >= 12)
 
-    try:
-        # 获取当前年月
-        current_yearmonth = current_time.strftime("%Y-%m")
-
-        # 获取历史提交记录
-        submitted_reports_info = api_client.get_submitted_reports_info("month")
-        submitted_reports = submitted_reports_info.get("data", [])
-
-        # 检查是否已经提交过本月的月报
-        if submitted_reports:
-            last_report = submitted_reports[0]
-            if last_report.get("yearmonth") == current_yearmonth:
-                logger.info("本月已经提交过月报，跳过本次提交")
-                return {
-                    "status": "skip",
-                    "message": "本月已经提交过月报",
-                    "task_type": "月报提交",
-                }
-
-        job_info = api_client.get_job_info()
-        month = submitted_reports_info.get("flag", 0) + 1
-        content = generate_article(
-            config,
-            f"第{month}月月报",
-            job_info,
-            config.get_value("planInfo.planPaper.monthPaperNum"),
-        )
-
-        # 上传图片并获取附件
-        attachments = upload_img(
-            api_client.get_upload_token(),
-            config.get_value("userInfo.orgJson.snowFlakeId"),
-            config.get_value("userInfo.userId"),
-            config.get_value("config.reportSettings.monthly.imageCount"),
-        )
-
-        report_info = {
-            "title": f"第{month}月月报",
-            "content": content,
-            "attachments": attachments,
-            "yearmonth": current_yearmonth,
-            "reportType": "month",
-            "jobId": job_info.get("jobId", None),
-            "formFieldDtoList": api_client.get_from_info(9),
-        }
-        api_client.submit_report(report_info)
-
-        logger.info(f"第{month}月月报已提交，提交月份：{current_yearmonth}")
-
-        return {
-            "status": "success",
-            "message": f"第{month}月月报已提交",
-            "task_type": "月报提交",
-            "details": {
-                "月报标题": f"第{month}月月报",
-                "提交月份": current_yearmonth,
-                "附件": attachments,
-            },
-            "report_content": content,
-        }
-    except Exception as e:
-        logger.error(f"月报提交失败: {e}")
-        return {
-            "status": "fail",
-            "message": f"月报提交失败: {str(e)}",
-            "task_type": "月报提交",
-        }
+    return _submit_report_common(
+        api_client=api_client,
+        config=config,
+        report_type="month",
+        title_func=lambda c: f"第{c}月月报",
+        check_time_func=check_time,
+        get_submitted_func=lambda: api_client.get_submitted_reports_info("month"),
+        paper_num_key="planInfo.planPaper.monthPaperNum",
+        image_count_key="config.reportSettings.monthly.imageCount",
+        task_name="月报提交",
+        form_type=9,
+    )
 
 
 def run(config: ConfigManager) -> None:
-    """
-    执行所有任务。
-
-    Args:
-        config (ConfigManager): 配置管理器。
-    """
-    # 设置日志上下文标签: 文件名/ENV + 脱敏昵称
+    """执行所有任务"""
+    # 设置日志上下文标签
     try:
-        file_part = "ENV"  # 默认环境变量来源
-        try:
-            path_attr = getattr(config, "_path", None)
-            if path_attr is not None:
-                file_part = os.path.splitext(os.path.basename(
-                    str(path_attr)))[0]
-        except Exception:
-            pass
-        nickname = desensitize_name(
-            config.get_value("userInfo.nikeName")) or "?"
+        file_part = "ENV"
+        path_attr = getattr(config, "_path", None)
+        if path_attr:
+            file_part = os.path.splitext(os.path.basename(str(path_attr)))[0]
+
+        nickname = desensitize_name(config.get_value("userInfo.nikeName")) or "?"
         _log_ctx.tag = f"{file_part}|{nickname}"
     except Exception:
         _log_ctx.tag = "-"
 
     results: List[Dict[str, Any]] = []
+    pusher = None
 
     try:
         pusher = MessagePusher(config.get_value("config.pushNotifications"))
-    except Exception as e:
-        logger.error(f"获取消息推送客户端失败: {str(e)}")
-        _log_ctx.tag = "-"  # 清理
-        return
 
-    try:
         api_client = ApiClient(config)
-        # 检查是否登录
         if not config.get_value("userInfo.token"):
             api_client.login()
 
         logger.info("获取用户信息成功")
-        # 检查用户类型和计划信息
+
         if config.get_value("userInfo.userType") == "teacher":
             logger.info("用户身份为教师，跳过计划信息检查")
         elif not config.get_value("planInfo.planId"):
             api_client.fetch_internship_plan()
             logger.info("已获取实习计划信息")
 
-    except Exception as e:
-        error_message = f"获取API客户端失败: {str(e)}"
-        logger.error(error_message)
-        results.append({
-            "status": "fail",
-            "message": error_message,
-            "task_type": "API客户端初始化"
-        })
-        pusher.push(results)
-        logger.info("任务异常结束")
-        _log_ctx.tag = "-"  # 清理
-        return
+        logger.info(
+            f"开始执行：{desensitize_name(config.get_value('userInfo.nikeName'))}"
+        )
 
-    logger.info(
-        f"开始执行：{desensitize_name(config.get_value('userInfo.nikeName'))}")
-
-    try:
         results = [
             perform_clock_in(api_client, config),
             submit_daily_report(api_client, config),
             submit_weekly_report(config, api_client),
             submit_monthly_report(config, api_client),
         ]
-    except Exception as e:
-        error_message = f"执行任务时发生错误: {str(e)}"
-        logger.error(error_message)
-        results.append({
-            "status": "fail",
-            "message": error_message,
-            "task_type": "任务执行"
-        })
 
-    pusher.push(results)
-    logger.info(
-        f"执行结束：{desensitize_name(config.get_value('userInfo.nikeName'))}")
-    _log_ctx.tag = "-"  # 清理
+    except Exception as e:
+        error_message = f"执行任务时发生严重错误: {str(e)}"
+        logger.error(error_message)
+        results.append(
+            {"status": "fail", "message": error_message, "task_type": "系统错误"}
+        )
+    finally:
+        if pusher:
+            try:
+                pusher.push(results)
+            except Exception as e:
+                logger.error(f"消息推送失败: {e}")
+
+        logger.info(
+            f"执行结束：{desensitize_name(config.get_value('userInfo.nikeName'))}"
+        )
+        _log_ctx.tag = "-"
 
 
 def execute_tasks(selected_files: Optional[List[str]] = None):
-    """
-    创建并执行任务。
-
-    Args:
-        selected_files (Optional[List[str]]): 指定配置文件列表（不含扩展名），默认为 None。
-    """
-    # 设置主线程的日志标签
+    """创建并执行任务"""
     _log_ctx.tag = "MAIN"
-
     logger.info("开始执行工学云任务")
 
-    # 获取用户目录下的所有 .json 文件(不含后缀)
+    json_files = []
     try:
-        json_files = [
-            f[:-5] for f in os.listdir(USER_DIR) if f.endswith(".json")
-        ]
-        logger.info(f"发现 {len(json_files)} 个配置文件")
+        if os.path.exists(USER_DIR):
+            json_files = [f[:-5] for f in os.listdir(USER_DIR) if f.endswith(".json")]
+            logger.info(f"发现 {len(json_files)} 个配置文件")
+        else:
+            logger.warning(f"用户目录不存在: {USER_DIR}")
     except OSError as e:
         logger.error(f"扫描配置文件目录失败: {e}")
-        json_files = []
 
-    # 筛选指定的配置文件
     if selected_files:
         existing_files = set(selected_files) & set(json_files)
         missing_files = set(selected_files) - existing_files
@@ -575,9 +450,8 @@ def execute_tasks(selected_files: Optional[List[str]] = None):
             logger.error(f"以下配置文件未找到: {', '.join(missing_files)}")
         json_files = list(existing_files)
 
-    # 从环境变量获取配置
-    user_env = os.getenv("USER")
     user_configs = []
+    user_env = os.getenv("USER")
     if user_env and user_env.strip():
         try:
             user_configs = json.loads(user_env)
@@ -588,40 +462,30 @@ def execute_tasks(selected_files: Optional[List[str]] = None):
                 logger.info(f"从环境变量中获取到 {len(user_configs)} 个配置")
         except json.JSONDecodeError as e:
             logger.error(f"USER 不是有效的JSON格式: {e}")
-            user_configs = []
-        except Exception as e:
-            logger.error(f"解析USER时发生意外错误: {e}")
-            user_configs = []
 
-    # 检查是否存在有效配置
     if not json_files and not user_configs:
         logger.warning("未找到任何有效配置")
         return
 
-    # 创建任务列表
     tasks = []
 
-    def add_task(source, **kwargs):
+    for config_data in user_configs:
         try:
-            tasks.append(ConfigManager(**kwargs))
-            logger.debug(f"已添加来自 {source} 的任务配置")
-        except Exception as err:
-            logger.error(f"创建来自 {source} 的任务失败: {err}")
+            tasks.append(ConfigManager(config=config_data))
+        except Exception as e:
+            logger.error(f"加载环境变量配置失败: {e}")
 
-    # 处理环境变量中的配置
-    for config in user_configs:
-        add_task("环境变量", config=config)
-
-    # 处理配置文件
     for name in json_files:
-        file_path = os.path.join(USER_DIR, f"{name}.json")
-        add_task(f"配置文件 {name}", path=file_path)
+        try:
+            file_path = os.path.join(USER_DIR, f"{name}.json")
+            tasks.append(ConfigManager(path=file_path))
+        except Exception as e:
+            logger.error(f"加载配置文件 {name} 失败: {e}")
 
     if not tasks:
         logger.error("没有成功创建任何任务")
         return
 
-    # 执行任务
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_task = {executor.submit(run, task): task for task in tasks}
         for future in concurrent.futures.as_completed(future_to_task):
@@ -629,13 +493,12 @@ def execute_tasks(selected_files: Optional[List[str]] = None):
             try:
                 future.result()
             except Exception as e:
-                logger.error(f"任务 {task} 处理过程中发生错误: {e}")
+                logger.error(f"任务处理过程中发生错误: {e}")
 
     logger.info("工学云任务执行结束")
 
 
 if __name__ == "__main__":
-    # 读取命令行参数
     parser = argparse.ArgumentParser(description="运行工学云任务")
     parser.add_argument(
         "--file",
@@ -644,6 +507,4 @@ if __name__ == "__main__":
         help="指定要执行的配置文件名（不带路径和后缀），可以一次性指定多个",
     )
     args = parser.parse_args()
-
-    # 执行命令
     execute_tasks(args.file)
