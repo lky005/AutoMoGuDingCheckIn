@@ -1,14 +1,15 @@
 name: "打卡"
 
-# 明确触发条件
+# 触发条件
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch: # 允许手动点按钮运行
   schedule:
-    # 使用 UTC 时间，UTC 时间 对应 北京时间 -8 小时
-    - cron: "30 0 * * *" # UTC 00:30 / 北京时间 08:30
-    - cron: "30 9 * * *" # UTC 09:30 / 北京时间 17:30
+    # 每天北京时间 08:30 (UTC 00:30)
+    - cron: "30 0 * * *"
+    # 每天北京时间 17:30 (UTC 09:30) - 备用补签
+    - cron: "30 9 * * *"
 
-# 配置并发控制，避免任务重叠执行
+# 并发控制：避免重复运行
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,41 +17,41 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10 # 添加超时限制
+    timeout-minutes: 10
 
     permissions:
       actions: write
       contents: read
 
     steps:
-      # 1. 设置时区为 Asia/Shanghai
+      # 1. 设置时区 (北京时间)
       - name: Set timezone
         uses: szenius/set-timezone@v2.0
         with:
           timezoneLinux: "Asia/Shanghai"
 
-      # 2. 检出代码仓库
+      # 2. 下载代码
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1 # 优化克隆深度
+          fetch-depth: 1
 
-      # 3. 【关键修改】禁用 IPv6 (修复工学云网络报错)
+      # 3. 【关键修复】禁用 IPv6 (防止工学云网络连不上)
       - name: Disable IPv6
         run: |
           sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
           sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
           sudo sysctl -p
 
-      # 4. 设置 Python 环境
+      # 4. 准备 Python 环境
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-          cache: "pip" # 启用 pip 缓存
+          cache: "pip"
           check-latest: true
 
-      # 5. 缓存 pip 依赖
+      # 5. 缓存依赖包 (加快运行速度)
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -65,20 +66,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 7. 【关键修改】生成配置并执行 (读取你的 USER_CONFIG)
+      # 7. 【关键修复】生成配置并运行
       - name: Generate Config & Run
         env:
-          # 注意：这里必须用你之前设置的 Secret 名字 "USER_CONFIG"
+          # 必须和你设置的 Secret 名字一致
           MY_SECRET_JSON: ${{ secrets.USER_CONFIG }}
           TZ: Asia/Shanghai
         run: |
-          # 把 Secret 里的内容写入 user/user.json
+          # A. 清理干扰文件 (删除自带的演示文件和报错文件)
+          rm -f user/example.json
+          rm -f user/USER
+          
+          # B. 把你的 Secret 写入真正的 user.json
           echo "$MY_SECRET_JSON" > user/user.json
           
-          # 运行主程序
+          # C. 运行脚本
           python main.py
 
-      # 8. 清理运行记录 (保持干净)
+      # 8. 清理历史记录 (保持页面干净)
       - name: Clean up workflow runs
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
