@@ -1,15 +1,15 @@
 name: "打卡"
 
-# 触发条件
 on:
-  workflow_dispatch: # 允许手动点按钮运行
+  workflow_dispatch: # 允许手动运行
   schedule:
-    # 每天北京时间 08:30 (UTC 00:30)
+    # ---------------------------------------------------------
+    # 北京时间 08:30 = UTC 00:30
+    # 北京时间 18:00 = UTC 10:00
+    # ---------------------------------------------------------
     - cron: "30 0 * * *"
-    # 每天北京时间 17:30 (UTC 09:30) - 备用补签
-    - cron: "30 9 * * *"
+    - cron: "0 10 * * *"
 
-# 并发控制：避免重复运行
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -17,33 +17,40 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 设置超时为 20 分钟，给随机等待留足时间
+    timeout-minutes: 20
 
     permissions:
       actions: write
       contents: read
 
     steps:
-      # 1. 设置时区 (北京时间)
       - name: Set timezone
         uses: szenius/set-timezone@v2.0
         with:
           timezoneLinux: "Asia/Shanghai"
 
-      # 2. 下载代码
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # 3. 【关键修复】禁用 IPv6 (防止工学云网络连不上)
+      # 关键步骤：随机延迟 60秒 ~ 600秒 (1~10分钟)
+      # 模拟真人，防止封号，同时保证时间肯定在 8:30 以后
+      - name: Random Sleep (Anti-Detection)
+        run: |
+          echo "正在生成随机延迟时间..."
+          SLEEP_TIME=$(shuf -i 60-600 -n 1)
+          echo "随机延迟: $SLEEP_TIME 秒"
+          sleep $SLEEP_TIME
+          echo "等待结束，开始执行打卡..."
+
       - name: Disable IPv6
         run: |
           sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
           sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
           sudo sysctl -p
 
-      # 4. 准备 Python 环境
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -51,7 +58,6 @@ jobs:
           cache: "pip"
           check-latest: true
 
-      # 5. 缓存依赖包 (加快运行速度)
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -60,30 +66,24 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 6. 安装依赖
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 7. 【关键修复】生成配置并运行
       - name: Generate Config & Run
         env:
-          # 必须和你设置的 Secret 名字一致
           MY_SECRET_JSON: ${{ secrets.USER_CONFIG }}
           TZ: Asia/Shanghai
         run: |
-          # A. 清理干扰文件 (删除自带的演示文件和报错文件)
+          # 清理无关文件
           rm -f user/example.json
           rm -f user/USER
-          
-          # B. 把你的 Secret 写入真正的 user.json
+          # 写入配置
           echo "$MY_SECRET_JSON" > user/user.json
-          
-          # C. 运行脚本
+          # 运行
           python main.py
 
-      # 8. 清理历史记录 (保持页面干净)
       - name: Clean up workflow runs
         if: always()
         uses: Mattraks/delete-workflow-runs@v2
